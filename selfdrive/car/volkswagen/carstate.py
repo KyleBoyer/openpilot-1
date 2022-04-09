@@ -4,7 +4,8 @@ from selfdrive.config import Conversions as CV
 from selfdrive.car.interfaces import CarStateBase
 from opendbc.can.parser import CANParser
 from opendbc.can.can_define import CANDefine
-from selfdrive.car.volkswagen.values import DBC_FILES, CANBUS, NetworkLocation, TransmissionType, GearShifter, BUTTON_STATES, CarControllerParams
+from selfdrive.car.volkswagen.values import DBC_FILES, CANBUS, NetworkLocation, TransmissionType, GearShifter, BUTTON_STATES, CarControllerParams, FEATURES
+from common.params import Params
 
 class CarState(CarStateBase):
   def __init__(self, CP):
@@ -16,18 +17,74 @@ class CarState(CarStateBase):
       self.shifter_values = can_define.dv["EV_Gearshift"]["GearPosition"]
     self.hca_status_values = can_define.dv["LH_EPS_03"]["EPS_HCA_Status"]
     self.buttonStates = BUTTON_STATES.copy()
+    self.buttonStatesPrev = BUTTON_STATES.copy()
+
+    self.resumeAvailable = False
+    self.accEnabled = False
+    self.accMainEnabled = False
+    self.leftBlinkerOn = False
+    self.rightBlinkerOn = False
+    self.disengageByBrake = False
+    self.belowLaneChangeSpeed = True
+    self.automaticLaneChange = True
+    self.accMainControl = False
+
+    self.acc_main_enabled = None
+    self.prev_acc_main_enabled = None
+
+    self.cruise_buttons = 0
+    self.prev_cruise_buttons = 0
+
+    self.acc_mads_combo = None
+    self.prev_acc_mads_combo = None
+
+    self.cruiseState_standstill = False
+
+    self.acc_active = False
+    self.cruise_active = False
+
+    self.prev_print = False
+    self.prev_print2 = False
+    self.prev_print3 = False
 
   def update(self, pt_cp, cam_cp, ext_cp, trans_type):
     ret = car.CarState.new_message()
+
+    self.prev_acc_main_enabled = self.acc_main_enabled
+    self.prev_cruise_buttons = self.cruise_buttons
+    self.buttonStatesPrev = self.buttonStates.copy()
+    self.disable_mads = Params().get_bool("DisableMADS")
+    self.acc_mads_combo = Params().get_bool("ACCMADSCombo")
+
+    # Read ACC hardware button type configuration info that has to pass thru
+    # to the radar. Ends up being different for steering wheel buttons vs
+    # third stalk type controls.
+    self.graHauptschalter = pt_cp.vl["GRA_ACC_01"]["GRA_Hauptschalter"]
+    self.graTypHauptschalter = pt_cp.vl["GRA_ACC_01"]["GRA_Typ_Hauptschalter"]
+    self.graButtonTypeInfo = pt_cp.vl["GRA_ACC_01"]["GRA_ButtonTypeInfo"]
+    self.graTipStufe2 = pt_cp.vl["GRA_ACC_01"]["GRA_Tip_Stufe_2"]
+
+    if self.CP.carFingerprint in FEATURES["acc_stalk"]:
+      self.acc_main_enabled = pt_cp.vl["GRA_ACC_01"]["GRA_Hauptschalter"]
+    elif self.CP.carFingerprint in FEATURES["acc_steering_wheel"]:
+      self.acc_main_enabled = pt_cp.vl["GRA_ACC_01"]["GRA_Hauptschalter"] == 0
+
+    if self.prev_acc_main_enabled is None:
+      self.prev_acc_main_enabled = self.acc_main_enabled
+
     # Update vehicle speed and acceleration from ABS wheel speeds.
-    ret.wheelSpeeds.fl = pt_cp.vl["ESP_19"]["ESP_VL_Radgeschw_02"] * CV.KPH_TO_MS
-    ret.wheelSpeeds.fr = pt_cp.vl["ESP_19"]["ESP_VR_Radgeschw_02"] * CV.KPH_TO_MS
-    ret.wheelSpeeds.rl = pt_cp.vl["ESP_19"]["ESP_HL_Radgeschw_02"] * CV.KPH_TO_MS
-    ret.wheelSpeeds.rr = pt_cp.vl["ESP_19"]["ESP_HR_Radgeschw_02"] * CV.KPH_TO_MS
+    ret.wheelSpeeds = self.get_wheel_speeds(
+      pt_cp.vl["ESP_19"]["ESP_VL_Radgeschw_02"],
+      pt_cp.vl["ESP_19"]["ESP_VR_Radgeschw_02"],
+      pt_cp.vl["ESP_19"]["ESP_HL_Radgeschw_02"],
+      pt_cp.vl["ESP_19"]["ESP_HR_Radgeschw_02"],
+    )
 
     ret.vEgoRaw = float(np.mean([ret.wheelSpeeds.fl, ret.wheelSpeeds.fr, ret.wheelSpeeds.rl, ret.wheelSpeeds.rr]))
     ret.vEgo, ret.aEgo = self.update_speed_kf(ret.vEgoRaw)
-    ret.standstill = bool(pt_cp.vl["ESP_21"]["ESP_Haltebestaetigung"])
+    ret.standstill = ret.vEgo < 0.1
+
+    ret.standStill = self.CP.standStill
 
     # Update steering angle, rate, yaw rate, and driver input torque. VW send
     # the sign/direction in a separate signal so they must be recombined.
@@ -40,13 +97,14 @@ class CarState(CarStateBase):
     # Verify EPS readiness to accept steering commands
     hca_status = self.hca_status_values.get(pt_cp.vl["LH_EPS_03"]["EPS_HCA_Status"])
     ret.steerError = hca_status in ["DISABLED", "FAULT"]
-    ret.steerWarning = hca_status in ["INITIALIZING", "REJECTED"]
 
     # Update gas, brakes, and gearshift.
     ret.gas = pt_cp.vl["Motor_20"]["MO_Fahrpedalrohwert_01"] / 100.0
     ret.gasPressed = ret.gas > 0
     ret.brake = pt_cp.vl["ESP_05"]["ESP_Bremsdruck"] / 250.0  # FIXME: this is pressure in Bar, not sure what OP expects
     ret.brakePressed = bool(pt_cp.vl["ESP_05"]["ESP_Fahrer_bremst"])
+    self.esp_hold_confirmation = pt_cp.vl["ESP_21"]["ESP_Haltebestaetigung"]
+    ret.brakeLights = bool(pt_cp.vl["ESP_05"]['ESP_Status_Bremsdruck'])
 
     # Update gear and/or clutch position data.
     if trans_type == TransmissionType.automatic:
@@ -94,13 +152,13 @@ class CarState(CarStateBase):
     ret.stockAeb = bool(ext_cp.vl["ACC_10"]["ANB_Teilbremsung_Freigabe"]) or bool(ext_cp.vl["ACC_10"]["ANB_Zielbremsung_Freigabe"])
 
     # Update ACC radar status.
-    accStatus = pt_cp.vl["TSK_06"]["TSK_Status"]
-    if accStatus == 2:
+    self.tsk_status = pt_cp.vl["TSK_06"]["TSK_Status"]
+    if self.tsk_status == 2:
       # ACC okay and enabled, but not currently engaged
       ret.cruiseState.available = True
       ret.cruiseState.enabled = False
-    elif accStatus in [3, 4, 5]:
-      # ACC okay and enabled, currently engaged and regulating speed (3) or engaged with driver accelerating (4) or overrun (5)
+    elif self.tsk_status in [3, 4, 5]:
+      # ACC okay and enabled, currently regulating speed (3) or driver accel override (4) or overrun coast-down (5)
       ret.cruiseState.available = True
       ret.cruiseState.enabled = True
     else:
@@ -108,11 +166,17 @@ class CarState(CarStateBase):
       ret.cruiseState.available = False
       ret.cruiseState.enabled = False
 
+    ret.cruiseState.standstill = bool(ret.cruiseState.enabled and self.esp_hold_confirmation)
+    self.cruiseState_standstill = ret.cruiseState.standstill
+
+    self.belowLaneChangeSpeed = ret.vEgo < (30 * CV.MPH_TO_MS)
+
     # Update ACC setpoint. When the setpoint is zero or there's an error, the
     # radar sends a set-speed of ~90.69 m/s / 203mph.
-    ret.cruiseState.speed = ext_cp.vl["ACC_02"]["ACC_Wunschgeschw"] * CV.KPH_TO_MS
-    if ret.cruiseState.speed > 90:
-      ret.cruiseState.speed = 0
+    if self.CP.pcmCruise:
+      ret.cruiseState.speed = ext_cp.vl["ACC_02"]["ACC_Wunschgeschw"] * CV.KPH_TO_MS
+      if ret.cruiseState.speed > 90:
+        ret.cruiseState.speed = 0
 
     # Update control button states for turn signals and ACC controls.
     self.buttonStates["accelCruise"] = bool(pt_cp.vl["GRA_ACC_01"]["GRA_Tip_Hoch"])
@@ -124,13 +188,94 @@ class CarState(CarStateBase):
     ret.leftBlinker = bool(pt_cp.vl["Blinkmodi_02"]["Comfort_Signal_Left"])
     ret.rightBlinker = bool(pt_cp.vl["Blinkmodi_02"]["Comfort_Signal_Right"])
 
-    # Read ACC hardware button type configuration info that has to pass thru
-    # to the radar. Ends up being different for steering wheel buttons vs
-    # third stalk type controls.
-    self.graHauptschalter = pt_cp.vl["GRA_ACC_01"]["GRA_Hauptschalter"]
-    self.graTypHauptschalter = pt_cp.vl["GRA_ACC_01"]["GRA_Typ_Hauptschalter"]
-    self.graButtonTypeInfo = pt_cp.vl["GRA_ACC_01"]["GRA_ButtonTypeInfo"]
-    self.graTipStufe2 = pt_cp.vl["GRA_ACC_01"]["GRA_Tip_Stufe_2"]
+    if bool(pt_cp.vl["GRA_ACC_01"]["GRA_Tip_Hoch"]):
+      self.cruise_buttons = 1
+    elif bool(pt_cp.vl["GRA_ACC_01"]["GRA_Tip_Runter"]):
+      self.cruise_buttons = 2
+    elif bool(pt_cp.vl["GRA_ACC_01"]["GRA_Abbrechen"]):
+      self.cruise_buttons = 3
+    elif bool(pt_cp.vl["GRA_ACC_01"]["GRA_Tip_Setzen"]):
+      self.cruise_buttons = 4
+    elif bool(pt_cp.vl["GRA_ACC_01"]["GRA_Tip_Wiederaufnahme"]):
+      self.cruise_buttons = 5
+    elif bool(pt_cp.vl["GRA_ACC_01"]["GRA_Verstellung_Zeitluecke"]):
+      self.cruise_buttons = 6
+    else:
+      self.cruise_buttons = 0
+
+    ret.cruiseButtons = self.cruise_buttons
+
+    if ret.cruiseState.available:
+      if not self.CP.pcmCruise or not self.CP.pcmCruiseSpeed:
+        if self.CP.carFingerprint in FEATURES["acc_stalk"]:
+          if (self.buttonStatesPrev["setCruise"] and not self.buttonStates["setCruise"]) or \
+            (self.buttonStatesPrev["decelCruise"] and not self.buttonStates["decelCruise"]): # SET-
+              self.accEnabled = True
+          elif (self.buttonStatesPrev["resumeCruise"] and not self.buttonStates["resumeCruise"]) or \
+            (self.buttonStatesPrev["accelCruise"] and not self.buttonStates["accelCruise"]): # RESUME+
+              self.accEnabled = True
+        elif self.CP.carFingerprint in FEATURES["acc_steering_wheel"]:
+          if self.prev_cruise_buttons == 4 and self.cruise_buttons != 4: # SET-
+            self.accEnabled = True
+          elif self.prev_cruise_buttons == 5 and self.cruise_buttons != 5: # RESUME+
+            self.accEnabled = True
+      if not self.disable_mads:
+        if self.CP.carFingerprint in FEATURES["acc_stalk"]:
+          if self.prev_acc_main_enabled != 1: #1 == not ACC Main button
+            if self.acc_main_enabled == 1:
+              self.accMainEnabled = True
+          elif self.prev_acc_main_enabled != 0: #0 == ACC Main button
+            if self.acc_main_enabled == 0:
+              self.accMainEnabled = False
+        elif self.CP.carFingerprint in FEATURES["acc_steering_wheel"]:
+          if self.prev_acc_main_enabled != 1: #1 == not ACC Main button
+            if self.acc_main_enabled == 1:
+              self.accMainEnabled = not self.accMainEnabled
+        if self.acc_mads_combo:
+          if not self.prev_acc_mads_combo and ret.cruiseState.enabled:
+            self.accMainEnabled = True
+          self.prev_acc_mads_combo = ret.cruiseState.enabled
+    else:
+      self.accMainEnabled = False
+      self.accEnabled = False
+
+    if (not self.CP.pcmCruise) or (self.CP.pcmCruise and self.CP.minEnableSpeed > 0) or not self.CP.pcmCruiseSpeed:
+      if self.CP.carFingerprint in FEATURES["acc_stalk"]:
+        if not self.buttonStatesPrev["cancel"]: # CANCEL
+          if self.buttonStates["cancel"]:
+            self.accEnabled = False
+            if self.disable_mads:
+              self.accMainEnabled = False
+      elif self.CP.carFingerprint in FEATURES["acc_steering_wheel"]:
+        if self.cruise_buttons != 3: # CANCEL
+          if self.cruise_buttons == 3:
+            self.accEnabled = False
+            if self.disable_mads:
+              self.accMainEnabled = False
+      if ret.brakePressed:
+        self.accEnabled = False
+        if self.disable_mads:
+          self.accMainEnabled = False
+
+    if self.CP.pcmCruise and self.CP.minEnableSpeed > 0 and self.CP.pcmCruiseSpeed:
+      if ret.gasPressed and not ret.cruiseState.enabled:
+        self.accEnabled = False
+      self.accEnabled = ret.cruiseState.enabled or self.accEnabled
+
+    if not self.CP.pcmCruise or not self.CP.pcmCruiseSpeed:
+      ret.cruiseState.enabled = self.accEnabled
+
+    if ret.cruiseState.enabled:
+      if self.disable_mads:
+        self.accMainEnabled = True
+      self.resumeAvailable = True
+
+    self.acc_active = ret.cruiseState.enabled
+    self.cruise_active = self.acc_active
+
+    self.leftBlinkerOn = bool(pt_cp.vl["Blinkmodi_02"]["Comfort_Signal_Left"])
+    self.rightBlinkerOn = bool(pt_cp.vl["Blinkmodi_02"]["Comfort_Signal_Right"])
+
     # Pick up the GRA_ACC_01 CAN message counter so we can sync to it for
     # later cruise-control button spamming.
     self.graMsgBusCounter = pt_cp.vl["GRA_ACC_01"]["COUNTER"]
@@ -138,6 +283,11 @@ class CarState(CarStateBase):
     # Additional safety checks performed in CarInterface.
     self.parkingBrakeSet = bool(pt_cp.vl["Kombi_01"]["KBI_Handbremse"])  # FIXME: need to include an EPB check as well
     ret.espDisabled = pt_cp.vl["ESP_21"]["ESP_Tastung_passiv"] != 0
+
+    ret.steerWarning = False
+    if self.accMainEnabled:
+      if (self.automaticLaneChange and not self.belowLaneChangeSpeed and (self.rightBlinkerOn or self.leftBlinkerOn)) or not (self.rightBlinkerOn or self.leftBlinkerOn):
+        ret.steerWarning = hca_status in ["INITIALIZING", "REJECTED"]
 
     return ret
 
@@ -166,6 +316,7 @@ class CarState(CarStateBase):
       ("AB_Gurtschloss_FA", "Airbag_02", 0),        # Seatbelt status, driver
       ("AB_Gurtschloss_BF", "Airbag_02", 0),        # Seatbelt status, passenger
       ("ESP_Fahrer_bremst", "ESP_05", 0),           # Brake pedal pressed
+      ("ESP_Status_Bremsdruck", "ESP_05", 0),       # Brakes applied
       ("ESP_Bremsdruck", "ESP_05", 0),              # Brake pressure applied
       ("MO_Fahrpedalrohwert_01", "Motor_20", 0),    # Accelerator pedal value
       ("EPS_Lenkmoment", "LH_EPS_03", 0),           # Absolute driver torque input

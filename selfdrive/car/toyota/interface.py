@@ -347,7 +347,7 @@ class CarInterface(CarInterfaceBase):
 
     extraGears = []
     if not (self.CS.CP.openpilotLongitudinalControl or self.CS.CP.enableGasInterceptor):
-      extraGears = [car.CarState.GearShifter.sport, car.CarState.GearShifter.low]
+      extraGears = [car.CarState.GearShifter.sport, car.CarState.GearShifter.low, car.CarState.GearShifter.brake]
 
     # events
     events = self.create_common_events(ret, extra_gears=extraGears, pcm_enable=False)
